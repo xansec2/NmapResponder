@@ -87,13 +87,13 @@ type searchsploitResult struct {
 }
 
 type exploitEntry struct {
-	Title   string `json:"Title"`
-	EdbID   string `json:"EDB-ID"`
-	Date    string `json:"Date_Published"`
-	Type    string `json:"Type"`
+	Title    string `json:"Title"`
+	EdbID    string `json:"EDB-ID"`
+	Date     string `json:"Date_Published"`
+	Type     string `json:"Type"`
 	Platform string `json:"Platform"`
-	Path    string `json:"Path"`
-	Codes   string `json:"Codes"` // CVE / OSVDB references, ';'-separated
+	Path     string `json:"Path"`
+	Codes    string `json:"Codes"` // CVE / OSVDB references, ';'-separated
 }
 
 // ---------------------------------------------------------------------------
@@ -468,15 +468,17 @@ func isAllDigits(s string) bool {
 
 func main() {
 	var (
-		file        string
-		target      string
-		noExploits  bool
-		noColor     bool
+		file       string
+		target     string
+		noExploits bool
+		noColor    bool
+		jsonOut    bool
 	)
 	flag.StringVar(&file, "f", "", "read nmap XML from this file instead of stdin")
 	flag.StringVar(&target, "t", "", "target used in suggested commands (defaults to scanned address)")
 	flag.BoolVar(&noExploits, "no-exploits", false, "skip searchsploit lookups")
 	flag.BoolVar(&noColor, "no-color", false, "disable ANSI colors")
+	flag.BoolVar(&jsonOut, "json", false, "emit structured JSON (per-port recommendations) instead of the text report")
 	flag.Parse()
 
 	if noColor || os.Getenv("NO_COLOR") != "" {
@@ -514,6 +516,18 @@ func main() {
 			ssAvailable = false
 			warn("searchsploit not found in PATH; skipping exploit lookups. Install exploitdb to enable them.")
 		}
+	}
+
+	// Structured output: emit a machine-readable report (consumed by PhantomDeck
+	// to drop recommended commands onto the engagement canvas) and stop.
+	if jsonOut {
+		rep := buildReport(run, target, ssAvailable && !noExploits)
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(rep); err != nil {
+			fatal("encode json: %v", err)
+		}
+		return
 	}
 
 	out := bufio.NewWriter(os.Stdout)
@@ -556,6 +570,103 @@ func main() {
 		fmt.Fprintf(out, "\n%sNo open ports found in the nmap output.%s\n", cYellow, cReset)
 	}
 	fmt.Fprintf(out, "\n%sDone. %d open port(s) analyzed.%s\n", cGray, totalOpen, cReset)
+}
+
+// ---------------------------------------------------------------------------
+// structured (JSON) report — same recommendations as the text output, but
+// machine-readable so PhantomDeck can place the commands on the canvas map.
+// ---------------------------------------------------------------------------
+
+type jsonReport struct {
+	Target string     `json:"target"`
+	Hosts  []jsonHost `json:"hosts"`
+}
+
+type jsonHost struct {
+	Address  string     `json:"address"`
+	Hostname string     `json:"hostname,omitempty"`
+	Ports    []jsonPort `json:"ports"`
+}
+
+type jsonPort struct {
+	Port     string        `json:"port"`
+	Protocol string        `json:"protocol"`
+	Service  string        `json:"service"`
+	Banner   string        `json:"banner,omitempty"`
+	Note     string        `json:"note,omitempty"`
+	Commands []string      `json:"commands"`
+	Exploits []jsonExploit `json:"exploits,omitempty"`
+}
+
+type jsonExploit struct {
+	EdbID string   `json:"edb_id"`
+	Title string   `json:"title"`
+	CVEs  []string `json:"cves,omitempty"`
+}
+
+// buildReport produces the structured recommendations for every open port.
+func buildReport(run nmapRun, target string, doExploits bool) jsonReport {
+	rep := jsonReport{Target: target}
+	for _, h := range run.Hosts {
+		hostTarget := target
+		if hostTarget == "" {
+			hostTarget = primaryAddr(h)
+		}
+		if hostTarget == "" {
+			hostTarget = "TARGET"
+		}
+
+		jh := jsonHost{Address: hostTarget}
+		if len(h.Hostnames) > 0 {
+			jh.Hostname = h.Hostnames[0].Name
+		}
+
+		for _, p := range h.Ports {
+			if !strings.HasPrefix(p.State.State, "open") {
+				continue
+			}
+			svc := p.Service
+			name := svc.Name
+			if svc.Tunnel == "ssl" && name == "http" {
+				name = "https"
+			}
+			banner := strings.TrimSpace(svc.Banner)
+			if banner == "" {
+				banner = strings.TrimSpace(strings.Join(nonEmpty(svc.Product, svc.Version, svc.ExtraInfo), " "))
+			}
+
+			jp := jsonPort{Port: p.PortID, Protocol: p.Protocol, Service: name, Banner: banner}
+
+			pl, ok := serviceBook[strings.ToLower(name)]
+			if !ok {
+				pl, ok = portBook[p.PortID]
+			}
+			if ok {
+				jp.Note = pl.note
+				for _, c := range pl.commands {
+					jp.Commands = append(jp.Commands, expand(c, hostTarget, p.PortID))
+				}
+			} else {
+				jp.Commands = append(jp.Commands, fmt.Sprintf("nc -nv %s %s   # manual banner grab", hostTarget, p.PortID))
+			}
+
+			if doExploits {
+				if term := searchTerm(svc); term != "" {
+					if entries, err := runSearchsploit(term); err == nil {
+						for _, e := range topN(entries, 12) {
+							jp.Exploits = append(jp.Exploits, jsonExploit{
+								EdbID: e.EdbID, Title: e.Title, CVEs: extractCVEs(e.Codes),
+							})
+						}
+					}
+				}
+			}
+
+			jh.Ports = append(jh.Ports, jp)
+		}
+		rep.Hosts = append(rep.Hosts, jh)
+	}
+	return rep
 }
 
 func printPort(out *bufio.Writer, p port, target string, doExploits bool) {
